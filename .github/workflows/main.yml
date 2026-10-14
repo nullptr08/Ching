@@ -1,0 +1,237 @@
+name: Discover and Scrape Admission Results
+
+on:
+  workflow_dispatch:
+    inputs:
+      discovery_max_empty:
+        description: 'Stop after N consecutive empty IDs (default: 10000)'
+        required: false
+        default: '10000'
+        type: string
+
+env:
+  PYTHON_VERSION: '3.11'
+  MAX_PARALLEL: 4
+
+jobs:
+  # Phase 1: Discover where valid IDs actually start
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      first_valid_id: ${{ steps.find.outputs.first_valid_id }}
+      last_valid_id: ${{ steps.find.outputs.last_valid_id }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Find valid ID range
+        id: find
+        run: |
+          python - << 'EOF'
+          import requests
+          import json
+          import os
+          import sys
+          from bs4 import BeautifulSoup
+          
+          BASE_URL = "https://daleel.admission.gov.sd/result2026/Result_2026.aspx"
+          MAX_EMPTY = int(os.environ.get('DISCOVERY_MAX_EMPTY', 10000))
+          
+          def check_id(app_id):
+              """Check if a single ID exists"""
+              try:
+                  session = requests.Session()
+                  session.headers.update({"User-Agent": "University-Authorized-Test/1.0"})
+                  
+                  # Load form
+                  resp = session.get(BASE_URL, timeout=15)
+                  soup = BeautifulSoup(resp.text, "html.parser")
+                  form = soup.find("form", id="form1")
+                  
+                  if not form:
+                      return False
+                  
+                  payload = {}
+                  for field in form.select('input[type="hidden"][name]'):
+                      name = field["name"]
+                      if name.lower() in {"txtcaptcha", "shareresultfield"}:
+                          continue
+                      payload[name] = field.get("value", "")
+                  
+                  payload.update({
+                      "DropDownList1": "1",
+                      "TextBox1": f"{app_id:08d}",
+                      "Button1": "عرض النتيجة",
+                  })
+                  
+                  resp = session.post(BASE_URL, data=payload, timeout=15)
+                  soup = BeautifulSoup(resp.text, "html.parser")
+                  message = soup.find(id="LabelMessage")
+                  
+                  if message:
+                      text = message.get_text(" ", strip=True)
+                      # Valid result = has message content and it's NOT an error
+                      # Error messages typically contain: "لا توجد نتيجة" or "غير موجود" or "خطأ"
+                      is_error = any(err in text for err in [
+                          "لا توجد نتيجة",  # No result
+                          "غير موجود",       # Not found
+                          "خطأ",            # Error
+                          "not found",
+                          "error",
+                          "invalid"
+                      ])
+                      return len(text) > 5 and not is_error
+                  return False
+              except Exception as e:
+                  return False
+          
+          # Exponential search to find rough boundary
+          print("Starting discovery...")
+          first_valid = None
+          
+          # Check if ID 1 exists
+          if check_id(1):
+              first_valid = 1
+              print("Found valid ID at start: 1")
+          else:
+              boundary = 1
+              while boundary < 99999999:
+                  print(f"Checking boundary: {boundary}")
+                  if check_id(boundary):
+                      first_valid = boundary
+                      break
+                  boundary *= 2
+                  if boundary > 99999999:
+                      boundary = 99999999
+              
+              if first_valid:
+                  # Binary search between boundary/2 and boundary
+                  low = max(1, boundary // 2)
+                  high = boundary
+                  while low < high:
+                      mid = (low + high) // 2
+                      if check_id(mid):
+                          high = mid
+                      else:
+                          low = mid + 1
+                  first_valid = low
+          
+          if not first_valid:
+              print("No valid IDs found!")
+              sys.exit(1)
+          
+          print(f"First valid ID: {first_valid}")
+          
+          # Now find last valid ID (scan forward until MAX_EMPTY consecutive misses)
+          last_valid = first_valid
+          empty_streak = 0
+          current = first_valid + 1
+          
+          while empty_streak < MAX_EMPTY and current <= 99999999:
+              if check_id(current):
+                  last_valid = current
+                  empty_streak = 0
+                  print(f"Found valid ID: {current}, continuing...")
+              else:
+                  empty_streak += 1
+              
+              current += 1
+              
+              if current % 1000 == 0:
+                  print(f"Scanned up to {current}, last valid: {last_valid}, empty streak: {empty_streak}")
+          
+          print(f"Last valid ID: {last_valid}")
+          print(f"Total valid range: {first_valid} to {last_valid}")
+          print(f"Estimated valid IDs: {last_valid - first_valid + 1}")
+          
+          # Set outputs
+          print(f"::set-output name=first_valid_id::{first_valid}")
+          print(f"::set-output name=last_valid_id::{last_valid}")
+          EOF
+        env:
+          DISCOVERY_MAX_EMPTY: ${{ github.event.inputs.discovery_max_empty || '10000' }}
+
+  # Phase 2: Scrape discovered range in 4 parallel batches
+  scrape:
+    needs: discover
+    if: needs.discover.outputs.first_valid_id != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        batch_id: [0, 1, 2, 3]  # Exactly 4 parallel jobs
+    
+    name: Batch ${{ matrix.batch_id }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Calculate batch range
+        id: calc
+        run: |
+          python - << 'EOF'
+          import os
+          
+          first = int(os.environ['FIRST_VALID'])
+          last = int(os.environ['LAST_VALID'])
+          batch_id = int(os.environ['BATCH_ID'])
+          total_batches = 4
+          
+          total_range = last - first + 1
+          batch_size = (total_range + total_batches - 1) // total_batches
+          
+          start = first + (batch_id * batch_size)
+          end = min(start + batch_size - 1, last)
+          
+          if start > end:
+              print("::set-output name=skip::true")
+          else:
+              print("::set-output name=skip::false")
+              print(f"::set-output name=start::{start}")
+              print(f"::set-output name=end::{end}")
+              print(f"Batch {batch_id}: {start} to {end} ({end - start + 1} IDs)")
+          EOF
+        env:
+          FIRST_VALID: ${{ needs.discover.outputs.first_valid_id }}
+          LAST_VALID: ${{ needs.discover.outputs.last_valid_id }}
+          BATCH_ID: ${{ matrix.batch_id }}
+
+      - name: Run scraper
+        if: steps.calc.outputs.skip != 'true'
+        run: |
+          python scraper.py ${{ steps.calc.outputs.start }} ${{ steps.calc.outputs.end }}
+
+      - name: Upload results
+        if: steps.calc.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-batch-${{ matrix.batch_id }}
+          path: |
+            results.jsonl
+            failed.txt
+            progress.json
+          if-no-files-found: ignore
+          retention-days: 30
+          
