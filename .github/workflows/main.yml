@@ -11,7 +11,6 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  MAX_PARALLEL: 4
 
 jobs:
   # Phase 1: Discover where valid IDs actually start
@@ -40,7 +39,6 @@ jobs:
         run: |
           python - << 'EOF'
           import requests
-          import json
           import os
           import sys
           from bs4 import BeautifulSoup
@@ -48,8 +46,11 @@ jobs:
           BASE_URL = "https://daleel.admission.gov.sd/result2026/Result_2026.aspx"
           MAX_EMPTY = int(os.environ.get('DISCOVERY_MAX_EMPTY', 10000))
           
+          # Exact error message that indicates invalid ID
+          INVALID_ID_MESSAGE = "رقم الاستمارة غير صحيح"
+          
           def check_id(app_id):
-              """Check if a single ID exists"""
+              """Check if a single ID exists and returns valid result"""
               try:
                   session = requests.Session()
                   session.headers.update({"User-Agent": "University-Authorized-Test/1.0"})
@@ -77,34 +78,46 @@ jobs:
                   
                   resp = session.post(BASE_URL, data=payload, timeout=15)
                   soup = BeautifulSoup(resp.text, "html.parser")
-                  message = soup.find(id="LabelMessage")
                   
-                  if message:
-                      text = message.get_text(" ", strip=True)
-                      # Valid result = has message content and it's NOT an error
-                      # Error messages typically contain: "لا توجد نتيجة" or "غير موجود" or "خطأ"
-                      is_error = any(err in text for err in [
-                          "لا توجد نتيجة",  # No result
-                          "غير موجود",       # Not found
-                          "خطأ",            # Error
-                          "not found",
-                          "error",
-                          "invalid"
-                      ])
-                      return len(text) > 5 and not is_error
-                  return False
+                  # Check LabelMessage for exact invalid ID message
+                  message_elem = soup.find(id="LabelMessage")
+                  if message_elem:
+                      message_text = message_elem.get_text(" ", strip=True)
+                      # If exact invalid message found, ID is not valid
+                      if INVALID_ID_MESSAGE in message_text:
+                          return False
+                  
+                  # Check for result tables (actual data)
+                  tables = soup.find_all("table")
+                  has_data_tables = False
+                  for table in tables:
+                      rows = table.find_all("tr")
+                      for row in rows:
+                          cells = row.find_all(["th", "td"])
+                          if len(cells) >= 2:  # Data rows have multiple cells
+                              has_data_tables = True
+                              break
+                      if has_data_tables:
+                          break
+                  
+                  # Valid only if: NO invalid message AND has data tables
+                  return has_data_tables
+                  
               except Exception as e:
+                  print(f"Error checking ID {app_id}: {e}")
                   return False
           
-          # Exponential search to find rough boundary
+          # Exponential search to find first valid ID
           print("Starting discovery...")
           first_valid = None
           
           # Check if ID 1 exists
+          print("Checking ID 1...")
           if check_id(1):
               first_valid = 1
               print("Found valid ID at start: 1")
           else:
+              print("ID 1 is invalid, searching for boundary...")
               boundary = 1
               while boundary < 99999999:
                   print(f"Checking boundary: {boundary}")
@@ -128,7 +141,7 @@ jobs:
                   first_valid = low
           
           if not first_valid:
-              print("No valid IDs found!")
+              print("No valid IDs found in entire range!")
               sys.exit(1)
           
           print(f"First valid ID: {first_valid}")
@@ -138,11 +151,14 @@ jobs:
           empty_streak = 0
           current = first_valid + 1
           
+          print(f"Scanning forward from {current} to find last valid ID...")
+          
           while empty_streak < MAX_EMPTY and current <= 99999999:
               if check_id(current):
                   last_valid = current
                   empty_streak = 0
-                  print(f"Found valid ID: {current}, continuing...")
+                  if current % 100 == 0:  # Log every 100 finds
+                      print(f"Found valid ID: {current}, continuing...")
               else:
                   empty_streak += 1
               
@@ -170,7 +186,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        batch_id: [0, 1, 2, 3]  # Exactly 4 parallel jobs
+        batch_id: [0, 1, 2, 3]
     
     name: Batch ${{ matrix.batch_id }}
     
@@ -222,6 +238,8 @@ jobs:
         if: steps.calc.outputs.skip != 'true'
         run: |
           python scraper.py ${{ steps.calc.outputs.start }} ${{ steps.calc.outputs.end }}
+        env:
+          BATCH_ID: ${{ matrix.batch_id }}
 
       - name: Upload results
         if: steps.calc.outputs.skip != 'true' && always()
@@ -229,9 +247,9 @@ jobs:
         with:
           name: results-batch-${{ matrix.batch_id }}
           path: |
-            results.jsonl
-            failed.txt
-            progress.json
+            results_batch_*.jsonl
+            failed_batch_*.txt
+            progress_batch_*.json
           if-no-files-found: ignore
           retention-days: 30
           
