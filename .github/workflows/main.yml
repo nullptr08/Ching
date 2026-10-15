@@ -41,13 +41,23 @@ jobs:
           import requests
           import os
           import sys
+          import re
           from bs4 import BeautifulSoup
           
           BASE_URL = "https://daleel.admission.gov.sd/result2026/Result_2026.aspx"
           MAX_EMPTY = int(os.environ.get('DISCOVERY_MAX_EMPTY', 10000))
           
-          # Exact error message that indicates invalid ID
-          INVALID_ID_MESSAGE = "رقم الاستمارة غير صحيح"
+          # Exact error messages that indicate invalid ID
+          INVALID_MESSAGES = [
+              "رقم الاستمارة غير صحيح",
+              "لا توجد نتيجة",
+              "غير موجود",
+              "خطأ",
+              "not found",
+              "error",
+              "invalid",
+              "no result"
+          ]
           
           def check_id(app_id):
               """Check if a single ID exists and returns valid result"""
@@ -61,7 +71,7 @@ jobs:
                   form = soup.find("form", id="form1")
                   
                   if not form:
-                      return False
+                      return False, "no_form"
                   
                   payload = {}
                   for field in form.select('input[type="hidden"][name]'):
@@ -79,50 +89,80 @@ jobs:
                   resp = session.post(BASE_URL, data=payload, timeout=15)
                   soup = BeautifulSoup(resp.text, "html.parser")
                   
-                  # Check LabelMessage for exact invalid ID message
+                  # Get full page text for analysis
+                  page_text = soup.get_text(" ", strip=True)
+                  
+                  # Check for invalid ID messages
+                  for invalid_msg in INVALID_MESSAGES:
+                      if invalid_msg in page_text:
+                          return False, f"invalid_msg: {invalid_msg}"
+                  
+                  # Check LabelMessage specifically
                   message_elem = soup.find(id="LabelMessage")
+                  message_text = ""
                   if message_elem:
                       message_text = message_elem.get_text(" ", strip=True)
-                      # If exact invalid message found, ID is not valid
-                      if INVALID_ID_MESSAGE in message_text:
-                          return False
+                      for invalid_msg in INVALID_MESSAGES:
+                          if invalid_msg in message_text:
+                              return False, f"label_invalid: {invalid_msg}"
                   
-                  # Check for result tables (actual data)
+                  # Check for result indicators:
+                  # 1. Tables with data
                   tables = soup.find_all("table")
-                  has_data_tables = False
-                  for table in tables:
-                      rows = table.find_all("tr")
-                      for row in rows:
-                          cells = row.find_all(["th", "td"])
-                          if len(cells) >= 2:  # Data rows have multiple cells
-                              has_data_tables = True
-                              break
-                      if has_data_tables:
-                          break
+                  has_tables = len(tables) > 0
                   
-                  # Valid only if: NO invalid message AND has data tables
-                  return has_data_tables
+                  # 2. Any div/span with substantial content (not just navigation)
+                  content_divs = soup.find_all(["div", "span", "td"], string=re.compile(r'\w{3,}'))
+                  has_content = len(content_divs) > 5
+                  
+                  # 3. Look for grade/score patterns (numbers, percentages)
+                  has_scores = bool(re.search(r'\d+%?|\d+\.\d+', page_text))
+                  
+                  # 4. Check if page has substantial text (not just form elements)
+                  text_length = len(page_text)
+                  
+                  # Debug output
+                  print(f"  ID {app_id:08d}: tables={has_tables}, content={has_content}, scores={has_scores}, text_len={text_length}, msg='{message_text[:50]}'")
+                  
+                  # Valid if: has tables OR (has content AND scores AND reasonable text length)
+                  is_valid = has_tables or (has_content and has_scores and text_length > 200)
+                  
+                  return is_valid, "valid" if is_valid else "insufficient_data"
                   
               except Exception as e:
-                  print(f"Error checking ID {app_id}: {e}")
-                  return False
+                  print(f"  ID {app_id:08d}: ERROR - {e}")
+                  return False, f"error: {e}"
+          
+          # Test a known ID first for debugging
+          print("Testing known ID format...")
+          test_id = 11044052  # Your original START_INDEX
+          is_valid, reason = check_id(test_id)
+          print(f"Test ID {test_id}: valid={is_valid}, reason={reason}")
+          
+          if not is_valid:
+              print("WARNING: Even the known test ID failed! Check site structure.")
+              print("Continuing anyway...")
           
           # Exponential search to find first valid ID
-          print("Starting discovery...")
+          print("\nStarting discovery...")
           first_valid = None
           
           # Check if ID 1 exists
           print("Checking ID 1...")
-          if check_id(1):
+          is_valid, reason = check_id(1)
+          if is_valid:
               first_valid = 1
               print("Found valid ID at start: 1")
           else:
-              print("ID 1 is invalid, searching for boundary...")
+              print(f"ID 1 invalid: {reason}")
+              print("Searching for boundary...")
               boundary = 1
               while boundary < 99999999:
                   print(f"Checking boundary: {boundary}")
-                  if check_id(boundary):
+                  is_valid, reason = check_id(boundary)
+                  if is_valid:
                       first_valid = boundary
+                      print(f"Found valid at boundary: {boundary}")
                       break
                   boundary *= 2
                   if boundary > 99999999:
@@ -134,7 +174,8 @@ jobs:
                   high = boundary
                   while low < high:
                       mid = (low + high) // 2
-                      if check_id(mid):
+                      is_valid, reason = check_id(mid)
+                      if is_valid:
                           high = mid
                       else:
                           low = mid + 1
@@ -142,9 +183,13 @@ jobs:
           
           if not first_valid:
               print("No valid IDs found in entire range!")
+              print("Possible issues:")
+              print("1. Site requires CAPTCHA")
+              print("2. Site structure changed")
+              print("3. All IDs are actually invalid")
               sys.exit(1)
           
-          print(f"First valid ID: {first_valid}")
+          print(f"\nFirst valid ID: {first_valid}")
           
           # Now find last valid ID (scan forward until MAX_EMPTY consecutive misses)
           last_valid = first_valid
@@ -154,10 +199,11 @@ jobs:
           print(f"Scanning forward from {current} to find last valid ID...")
           
           while empty_streak < MAX_EMPTY and current <= 99999999:
-              if check_id(current):
+              is_valid, reason = check_id(current)
+              if is_valid:
                   last_valid = current
                   empty_streak = 0
-                  if current % 100 == 0:  # Log every 100 finds
+                  if current % 100 == 0:
                       print(f"Found valid ID: {current}, continuing...")
               else:
                   empty_streak += 1
@@ -167,7 +213,7 @@ jobs:
               if current % 1000 == 0:
                   print(f"Scanned up to {current}, last valid: {last_valid}, empty streak: {empty_streak}")
           
-          print(f"Last valid ID: {last_valid}")
+          print(f"\nLast valid ID: {last_valid}")
           print(f"Total valid range: {first_valid} to {last_valid}")
           print(f"Estimated valid IDs: {last_valid - first_valid + 1}")
           
@@ -252,4 +298,3 @@ jobs:
             progress_batch_*.json
           if-no-files-found: ignore
           retention-days: 30
-          
