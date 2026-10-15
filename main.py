@@ -8,7 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 
 # Target URL
-URL = "https://daleel.admission.gov.sd/result2026/Result_2026.aspx
+URL = "https://daleel.admission.gov.sd/result2026/Result_2026.aspx"
 
 # Thread-safe locks
 print_lock = threading.Lock()
